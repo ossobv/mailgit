@@ -1,0 +1,262 @@
+#!/bin/sh
+# mailgit -- Keep track of MAIL domain/user/alias history using a Git repo
+# Copyright (C) 2019 Walter Doekes, OSSO B.V.
+#
+# mailgit is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version.
+#
+# mailgit has been tested against an ancient Modoboa install. This could
+# use some improvement...
+#
+# Usage:
+# - set up repository in /srv/mailgit (see GIT_DIR)
+# - run cron job: 35 0,12 * * * root /usr/local/bin/mailgit update-all
+#
+# Searching through history is a as easy as using git-log and git-blame:
+# - git log -S example.com
+# - git blame e/example.com
+#
+# Dependencies: git, grep, sed, find
+# See also: dnsgit <https://github.com/ossobv/dnsgit/>
+
+########################################################################
+# Default configuration, override through /etc/default/mailgit
+########################################################################
+_sql_call() {
+    _database=vmail
+    mysql --defaults-file=/etc/mysql/debian.cnf "$_database" -BNe "$@" |
+        tr '\t' '|'
+}
+DB_CALL=_sql_call
+GIT_DIR=/srv/mailgit
+########################################################################
+
+#set +o histexpand  
+
+short_help_and_exit() {
+    echo "Usage: mailgit COMMAND ARGS.." >&2
+    echo "See: mailgit help" >&2
+    exit 1
+}
+
+# Optionally load configuration from /etc/default/mailgit.
+test -f /etc/default/mailgit && . /etc/default/mailgit
+
+cd "$GIT_DIR" || exit 1
+cmd="$1"
+test -z "$cmd" && short_help_and_exit
+shift
+
+domains_from_git() {
+    find "$GIT_DIR" -mindepth 2 -maxdepth 2 '!' -path "$GIT_DIR/.git/*" |
+      sed -e "s#.*/##;s/[ ']//g" | sort -V
+}
+
+domains_from_db() {
+    $DB_CALL "\
+        SELECT LOWER(name) FROM admin_domain WHERE enabled = 1
+        UNION SELECT LOWER(name) FROM admin_domainalias WHERE enabled = 1;" |
+      sed -e "s/[ ']//g" | sort -uV
+}
+
+dump_domain() {
+    domain="$1"
+    write="$2"
+
+    # /etc/postfix/mysql-virtual-mailbox-domains.cf
+    #
+    # Does the domain exists at all?
+    exists=$($DB_CALL "\
+        SELECT 1
+        FROM admin_domain d
+        LEFT JOIN admin_domainalias a ON a.target_id = d.id
+        WHERE d.enabled = 1 AND (
+            d.name = '$domain' OR (a.enabled = 1 AND a.name = '$domain')
+        );")
+    test -z "$exists" && return
+
+    # Put files in a d/domain/ subdir.
+    subdir="$GIT_DIR/$(echo "$domain" | sed -e 's#\(.\).*#\1/&#')"
+    mkdir -p "$(dirname "$subdir")"
+
+    # /etc/postfix/mysql-virtual-domainalias-maps.cf
+    #
+    # Domain alias.
+    alias=$($DB_CALL "\
+        SELECT d.name AS addr FROM admin_domainalias a \
+        INNER JOIN admin_domain d ON d.id = a.target_id \
+        WHERE a.name = '$domain' AND a.enabled = 1 AND d.enabled = 1;")
+    if test -n "$alias"; then
+        if test -z "$write"; then
+            echo "$domain -> $alias"
+        else
+            aliasdir="../$(echo "$alias" | sed -e 's#\(.\).*#\1/&#')"
+            test -d "$subdir" && rm -rf "$subdir"
+            ln -sf "$aliasdir" "$subdir"
+        fi
+        return
+    fi
+
+    # Make sure the dir exists; but remove it first, to clean everything up.
+    if test -n "$write"; then
+        # FIXME: It'd be nicer if we didn't have to RM and then re-create. But
+        # that's troublesome.
+        rm -rf "$subdir"
+    fi
+
+    # /etc/postfix/mysql-virtual-mailbox2alias-maps.cf
+    #
+    # Real mailboxes.
+    users=$($DB_CALL "\
+        SELECT mb.address
+        FROM admin_mailbox mb
+        INNER JOIN admin_domain dom ON mb.domain_id = dom.id
+        INNER JOIN auth_user user ON mb.user_id = user.id
+        WHERE dom.enabled = 1 AND user.is_active = 1 AND
+            dom.name = '$domain';")
+    if test -n "$users"; then
+        mkdir -p "$subdir"
+        echo "$users" | LC_ALL=C sort -V | while read line; do
+            if test -z "$write"; then
+                echo "$domain/$line@$domain DIR"
+            else
+                source="$subdir/$line@$domain"
+                mkdir -p "$source"
+                touch "$source/mbox"
+            fi
+        done
+    fi
+
+    # /etc/postfix/mysql-virtual-alias-maps.cf
+    # /etc/postfix/mysql-virtual-aliascatchall-maps.cf (not needed)
+    #
+    # First part of union would ref internal accounts. Second part would ref
+    # external mailboxes.
+    useraliases=$($DB_CALL "\
+        SELECT t.from_, GROUP_CONCAT(t.to_ SEPARATOR ', ') FROM
+        ((
+            SELECT al.address AS from_,
+                GROUP_CONCAT(
+                    CONCAT(mb.address, '@', dom.name)
+                    ORDER BY dom.name, mb.address
+                    SEPARATOR ', ') AS to_
+            FROM admin_mailbox mb
+            INNER JOIN admin_domain dom ON dom.id = mb.domain_id
+            INNER JOIN admin_alias_mboxes al_mb ON al_mb.mailbox_id = mb.id
+            INNER JOIN admin_alias al ON al.id = al_mb.alias_id
+            INNER JOIN admin_domain dom2 ON dom2.id = al.domain_id
+            WHERE dom2.name = '$domain' AND dom2.enabled = 1 AND
+                    al.enabled = 1
+            GROUP BY dom2.name, al.address
+        ) UNION (
+            SELECT al.address AS from_, al.extmboxes AS to_
+            FROM admin_alias al
+            INNER JOIN admin_domain dom ON al.domain_id = dom.id
+            WHERE dom.name = '$domain' AND dom.enabled = 1 AND
+                al.enabled = 1 AND al.extmboxes <> ''
+        )) t GROUP BY t.from_;")
+    if test -n "$useraliases"; then
+        mkdir -p "$subdir"
+        echo "$useraliases" | LC_ALL=C sort -V | while read line; do
+            from=${line%%|*}
+            to=${line#*|}
+            if test -z "$write"; then
+                echo "$domain/$from@$domain -> $to"
+            else
+                source="$from@$domain"
+                todomain="${to##*@}"
+                tosubdir="$(echo "$todomain" | sed -e 's#\(.\).*#\1/&#')"
+                # Single destination AND we own the domain? Symlink.
+                if test "${to%,*}" = "$to" && test -d "$GIT_DIR/$tosubdir"; then
+                    dest="$to"
+                    test "$domain" != "$todomain" && dest="../../$tosubdir/$dest"
+                    if test -d "$subdir/$source"; then
+                        ln -s "../$dest" "$subdir/$source/alias"
+                    else
+                        ln -s "$dest" "$subdir/$source"
+                    fi
+                # Multiple destinations OR external domain. Create file.
+                else
+                    test -d "$subdir/$source" && source="$source/alias"
+                    echo "$(echo "$to" | sed -e 's/ //g' | tr ',' '\n')" \
+                        >"$subdir/$source"
+                fi
+            fi
+        done
+    fi
+}
+
+remove_old_domains() {
+    diff "$1" "$2" | sed -e '/^> /!d;s/..//' |
+      while read domain; do
+        path=$(echo "$domain" | sed -e 's#/##g;s#\(.\).*#\1/&#')
+        git rm "$path" >/dev/null || rm "$path"
+      done
+}
+
+generate_commit_msg() {
+    msg=$(git status --porcelain | sed -e 's#^.. ./##;s#.*/\(.*\)/.*#\1#;s#.*/##' |
+          tr '\n' ' ' | sed -re '
+            /.{60}.*/s/(.{60}).*/changed: \1.../;/.{60}/!s/.*/changed: &/')
+    if test -n "$msg"; then
+        true
+    elif git status --porcelain | grep -qF ''; then
+        msg='unknown changes? (fix this commit msg)'
+    else
+        msg=''  # nothing
+    fi
+    echo "$msg"
+}
+
+
+case $cmd in
+help|-h|--help)
+    echo "Usage: mailgit COMMAND ARGS.."
+    echo
+    echo "Commands:"
+    echo "  domains               List domains to dump."
+    echo "  domain DOMAIN         Dump a single domain."
+    echo "  update-all            Dump mail domains, remove old, commit."
+    ;;
+domain)
+    dump_domain "$1"
+    ;;
+domains)
+    domains_from_db
+    ;;
+update-all)
+    domains=$(domains_from_db)
+    ret=0
+    for domain in $domains; do
+        dump_domain $domain WRITE || ret=1
+    done
+
+    saved=$(mktemp)
+    echo "$domains" >"$saved"
+    local=$(mktemp)
+    domains_from_git >"$local"
+    remove_old_domains "$saved" "$local"
+    rm "$saved" "$local"
+
+    # Add all new/changed domains.
+    git add -A
+
+    # Create commit message and push.
+    msg=$(generate_commit_msg)
+    if test -n "$msg"; then
+        git commit -m "$msg" >/dev/null
+        if test -t 1; then
+            echo "Committed: $msg"
+        else
+            git show
+        fi
+    fi
+    ;;
+*)
+    short_help_and_exit
+    ;;
+esac
+
+# vim: set ts=8 sw=4 sts=4 et ai:
